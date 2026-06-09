@@ -2,16 +2,10 @@
 NVIDIA NIM Free API — Image & Video Generator
 Uses free credits from build.nvidia.com (no credit card required).
 
-Setup:
-  1. Sign up at https://build.nvidia.com
-  2. Generate an API key (starts with nvapi-)
-  3. Set it: export NVIDIA_API_KEY=nvapi-xxxx
-  4. pip install requests pillow
-
 Usage:
-  python generate.py image "a futuristic city at night"
-  python generate.py video "path/to/input.jpg"
-  python generate.py both "a golden retriever on a beach"
+  py generate.py image "a futuristic city at night"
+  py generate.py video path/to/input.jpg
+  py generate.py both "a golden retriever on a beach"
 """
 
 import os
@@ -34,23 +28,19 @@ HEADERS = {
 def check_api_key():
     if not API_KEY or not API_KEY.startswith("nvapi-"):
         print("ERROR: Set your NVIDIA API key first:")
-        print("  export NVIDIA_API_KEY=nvapi-xxxx")
+        print('  $env:NVIDIA_API_KEY="nvapi-xxxx"')
         print("  Get one free at https://build.nvidia.com")
         sys.exit(1)
 
 
-def generate_image(prompt: str, output_path: str = "output_image.jpg",
-                   width: int = 1024, height: int = 1024, steps: int = 4) -> str:
+def generate_image(prompt: str, output_path: str = "output_image.jpg") -> str:
     print(f"Generating image: {prompt!r}")
     url = f"{BASE_URL}/genai/black-forest-labs/flux.1-schnell"
     payload = {
         "prompt": prompt,
-        "width": width,
-        "height": height,
-        "num_inference_steps": steps,
-        "guidance": 0,
+        "width": 1024,
+        "height": 1024,
         "seed": 0,
-        "output_format": "jpeg",
     }
     response = requests.post(url, headers=HEADERS, json=payload, timeout=120)
     if response.status_code != 200:
@@ -68,8 +58,7 @@ def generate_image(prompt: str, output_path: str = "output_image.jpg",
     return output_path
 
 
-def generate_video(image_path: str, output_path: str = "output_video.mp4",
-                   motion_bucket_id: int = 127, fps: int = 6) -> str:
+def generate_video(image_path: str, output_path: str = "output_video.mp4") -> str:
     print(f"Generating video from: {image_path}")
     with open(image_path, "rb") as f:
         img_b64 = base64.b64encode(f.read()).decode("utf-8")
@@ -78,8 +67,6 @@ def generate_video(image_path: str, output_path: str = "output_video.mp4",
     url = f"{BASE_URL}/genai/stabilityai/stable-video-diffusion"
     payload = {
         "image": f"data:{mime};base64,{img_b64}",
-        "cfg_scale": 2.5,
-        "motion_bucket_id": motion_bucket_id,
         "seed": 0,
     }
     response = requests.post(url, headers=HEADERS, json=payload, timeout=120)
