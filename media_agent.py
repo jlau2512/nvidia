@@ -6,7 +6,10 @@ The agent creates a COMPLETE social media package:
              → Google Gemini (500/day free) → Cloudflare (50/day free)
              → HuggingFace → fal.ai → NVIDIA NIM → Fireworks → DeepInfra
   Video   → Pollinations (free/no-key) → HuggingFace Wan2.2
+             → Novita Kling (async, $0.50 credits) → MiniMax/Hailuo
              → fal.ai (CogVideoX, Kling, Wan)
+  Animate → animate_image: bring a still image to life as a video clip
+             fal.ai Kling i2v → fal.ai MiniMax i2v → Novita Kling i2v
   Copy    → Platform-native captions, hooks, CTAs
   Hashtags → 3-tier strategy (niche + mid + mega)
   Music   → Royalty-free recs with BPM + free sources
@@ -27,6 +30,7 @@ All others optional (agent auto-selects based on what's available):
   FIREWORKS_API_KEY   → fireworks.ai                  ($1 signup credits)
   DEEPINFRA_TOKEN     → deepinfra.com                 ($5 signup credits)
   NOVITA_API_KEY      → novita.ai                     ($0.50 + Kling video)
+  MINIMAX_API_KEY     → minimax.io                    (MiniMax/Hailuo video)
 
 Setup:
   pip install anthropic requests pillow together huggingface_hub
@@ -62,6 +66,7 @@ NVIDIA_KEY     = os.environ.get("NVIDIA_API_KEY", "")
 FIREWORKS_KEY  = os.environ.get("FIREWORKS_API_KEY", "")
 DEEPINFRA_KEY  = os.environ.get("DEEPINFRA_TOKEN", "")
 NOVITA_KEY     = os.environ.get("NOVITA_API_KEY", "")
+MINIMAX_KEY    = os.environ.get("MINIMAX_API_KEY", "")
 
 OUTPUT_DIR = Path("media_output")
 
@@ -293,6 +298,203 @@ def _video_fal(prompt: str, filename: str) -> dict:
         return {"success": False, "path": "", "provider": "fal.ai Video", "error": str(e)}
 
 
+def _video_novita(prompt: str, filename: str) -> dict:
+    """Novita Kling text-to-video — async polling, $0.50 credits at novita.ai."""
+    if not NOVITA_KEY:
+        return {"success": False, "path": "", "provider": "Novita T2V", "error": "NOVITA_API_KEY not set (credits at novita.ai)"}
+    headers = {"Authorization": f"Bearer {NOVITA_KEY}", "Content-Type": "application/json"}
+    payload = {"model_name": "kling-v1-5", "prompt": prompt, "width": 768, "height": 1024, "duration": 5}
+    try:
+        r = requests.post(
+            "https://api.novita.ai/v3/async/txt2video-kling-v3.0-std",
+            headers=headers, json=payload, timeout=60,
+        )
+        if r.status_code != 200:
+            return {"success": False, "path": "", "provider": "Novita T2V", "error": f"HTTP {r.status_code}: {r.text[:200]}"}
+        task_id = r.json().get("task_id", "")
+        if not task_id:
+            return {"success": False, "path": "", "provider": "Novita T2V", "error": "No task_id returned"}
+        # Poll up to 300s
+        deadline = time.time() + 300
+        while time.time() < deadline:
+            time.sleep(10)
+            pr = requests.get(
+                f"https://api.novita.ai/v3/async/task-result?task_id={task_id}",
+                headers=headers, timeout=30,
+            )
+            if pr.status_code != 200:
+                continue
+            data = pr.json()
+            status = data.get("task", {}).get("status", "")
+            if status == "TASK_STATUS_SUCCEED":
+                video_url = data.get("task", {}).get("output", {}).get("video_url", "")
+                if not video_url:
+                    # Try alternate path
+                    videos = data.get("videos", [])
+                    video_url = videos[0].get("video_url", "") if videos else ""
+                if video_url:
+                    vr = requests.get(video_url, timeout=120)
+                    return {"success": True, "path": _save(vr.content, filename), "provider": "Novita Kling T2V", "error": ""}
+                return {"success": False, "path": "", "provider": "Novita T2V", "error": "Succeeded but no video_url in response"}
+            if status in ("TASK_STATUS_FAILED", "TASK_STATUS_CANCELED"):
+                return {"success": False, "path": "", "provider": "Novita T2V", "error": f"Task {status}"}
+        return {"success": False, "path": "", "provider": "Novita T2V", "error": "Timed out after 300s"}
+    except Exception as e:
+        return {"success": False, "path": "", "provider": "Novita T2V", "error": str(e)}
+
+
+def _video_minimax(prompt: str, filename: str) -> dict:
+    """MiniMax/Hailuo video-01 — poll until Success, then retrieve download URL."""
+    if not MINIMAX_KEY:
+        return {"success": False, "path": "", "provider": "MiniMax Video", "error": "MINIMAX_API_KEY not set (minimax.io)"}
+    headers = {"Authorization": f"Bearer {MINIMAX_KEY}", "Content-Type": "application/json"}
+    try:
+        r = requests.post(
+            "https://api.minimax.io/v1/video_generation",
+            headers=headers, json={"model": "video-01", "prompt": prompt}, timeout=60,
+        )
+        if r.status_code != 200:
+            return {"success": False, "path": "", "provider": "MiniMax Video", "error": f"HTTP {r.status_code}: {r.text[:200]}"}
+        task_id = r.json().get("task_id", "")
+        if not task_id:
+            return {"success": False, "path": "", "provider": "MiniMax Video", "error": "No task_id returned"}
+        # Poll up to 300s
+        deadline = time.time() + 300
+        while time.time() < deadline:
+            time.sleep(10)
+            pr = requests.get(
+                f"https://api.minimax.io/v1/query/video_generation?task_id={task_id}",
+                headers=headers, timeout=30,
+            )
+            if pr.status_code != 200:
+                continue
+            data = pr.json()
+            status = data.get("status", "")
+            if status == "Success":
+                file_id = data.get("file_id", "")
+                if not file_id:
+                    return {"success": False, "path": "", "provider": "MiniMax Video", "error": "No file_id in success response"}
+                fr = requests.get(
+                    f"https://api.minimax.io/v1/files/retrieve?file_id={file_id}",
+                    headers=headers, timeout=30,
+                )
+                if fr.status_code != 200:
+                    return {"success": False, "path": "", "provider": "MiniMax Video", "error": f"File retrieve HTTP {fr.status_code}"}
+                download_url = fr.json().get("file", {}).get("download_url", "")
+                if download_url:
+                    vr = requests.get(download_url, timeout=120)
+                    return {"success": True, "path": _save(vr.content, filename), "provider": "MiniMax Hailuo Video", "error": ""}
+                return {"success": False, "path": "", "provider": "MiniMax Video", "error": "No download_url in file response"}
+            if status in ("Fail", "Failed"):
+                return {"success": False, "path": "", "provider": "MiniMax Video", "error": f"Task failed: {data}"}
+        return {"success": False, "path": "", "provider": "MiniMax Video", "error": "Timed out after 300s"}
+    except Exception as e:
+        return {"success": False, "path": "", "provider": "MiniMax Video", "error": str(e)}
+
+
+# ── Image-to-video helpers ─────────────────────────────────────────────────────
+
+def _upload_to_fal(image_path: str) -> str:
+    """Upload a local image to fal.ai CDN and return public URL."""
+    with open(image_path, "rb") as f:
+        data = f.read()
+    ext = Path(image_path).suffix.lower()
+    mime = "image/jpeg" if ext in (".jpg", ".jpeg") else "image/png"
+    headers = {"Authorization": f"Key {FAL_KEY}", "Content-Type": mime}
+    r = requests.post("https://fal.run/files/upload", headers=headers, data=data, timeout=60)
+    if r.status_code == 200:
+        return r.json().get("url", "")
+    return ""
+
+
+def _i2v_fal_kling(img_url: str, motion_prompt: str, filename: str) -> dict:
+    """fal.ai Kling v2.1 image-to-video."""
+    if not FAL_KEY:
+        return {"success": False, "path": "", "provider": "fal.ai Kling i2v", "error": "FAL_KEY not set"}
+    headers = {"Authorization": f"Key {FAL_KEY}", "Content-Type": "application/json"}
+    payload = {"image_url": img_url, "prompt": motion_prompt}
+    try:
+        r = requests.post(
+            "https://fal.run/fal-ai/kling-video/v2.1/master/image-to-video",
+            headers=headers, json=payload, timeout=300,
+        )
+        if r.status_code == 200:
+            video_url = r.json().get("video", {}).get("url", "")
+            if video_url:
+                vr = requests.get(video_url, timeout=120)
+                return {"success": True, "path": _save(vr.content, filename), "provider": "fal.ai Kling i2v", "error": ""}
+        return {"success": False, "path": "", "provider": "fal.ai Kling i2v", "error": f"HTTP {r.status_code}: {r.text[:200]}"}
+    except Exception as e:
+        return {"success": False, "path": "", "provider": "fal.ai Kling i2v", "error": str(e)}
+
+
+def _i2v_fal_minimax(img_url: str, motion_prompt: str, filename: str) -> dict:
+    """fal.ai MiniMax Hailuo-02 image-to-video."""
+    if not FAL_KEY:
+        return {"success": False, "path": "", "provider": "fal.ai MiniMax i2v", "error": "FAL_KEY not set"}
+    headers = {"Authorization": f"Key {FAL_KEY}", "Content-Type": "application/json"}
+    payload = {"image_url": img_url, "prompt": motion_prompt}
+    try:
+        r = requests.post(
+            "https://fal.run/fal-ai/minimax/hailuo-02/standard/image-to-video",
+            headers=headers, json=payload, timeout=300,
+        )
+        if r.status_code == 200:
+            video_url = r.json().get("video", {}).get("url", "")
+            if video_url:
+                vr = requests.get(video_url, timeout=120)
+                return {"success": True, "path": _save(vr.content, filename), "provider": "fal.ai MiniMax i2v", "error": ""}
+        return {"success": False, "path": "", "provider": "fal.ai MiniMax i2v", "error": f"HTTP {r.status_code}: {r.text[:200]}"}
+    except Exception as e:
+        return {"success": False, "path": "", "provider": "fal.ai MiniMax i2v", "error": str(e)}
+
+
+def _i2v_novita_kling(img_url: str, motion_prompt: str, filename: str) -> dict:
+    """Novita Kling image-to-video — async polling."""
+    if not NOVITA_KEY:
+        return {"success": False, "path": "", "provider": "Novita Kling i2v", "error": "NOVITA_API_KEY not set"}
+    headers = {"Authorization": f"Bearer {NOVITA_KEY}", "Content-Type": "application/json"}
+    payload = {"model_name": "kling-v1-5", "image_url": img_url, "prompt": motion_prompt, "duration": 5}
+    try:
+        r = requests.post(
+            "https://api.novita.ai/v3/async/img2video-kling-v3.0-std",
+            headers=headers, json=payload, timeout=60,
+        )
+        if r.status_code != 200:
+            return {"success": False, "path": "", "provider": "Novita Kling i2v", "error": f"HTTP {r.status_code}: {r.text[:200]}"}
+        task_id = r.json().get("task_id", "")
+        if not task_id:
+            return {"success": False, "path": "", "provider": "Novita Kling i2v", "error": "No task_id returned"}
+        deadline = time.time() + 300
+        delay = 10
+        while time.time() < deadline:
+            time.sleep(delay)
+            pr = requests.get(
+                f"https://api.novita.ai/v3/async/task-result?task_id={task_id}",
+                headers=headers, timeout=30,
+            )
+            if pr.status_code != 200:
+                delay = min(delay * 2, 30)
+                continue
+            data = pr.json()
+            status = data.get("task", {}).get("status", "")
+            if status == "TASK_STATUS_SUCCEED":
+                videos = data.get("videos", [])
+                video_url = videos[0].get("video_url", "") if videos else ""
+                if not video_url:
+                    video_url = data.get("task", {}).get("output", {}).get("video_url", "")
+                if video_url:
+                    vr = requests.get(video_url, timeout=120)
+                    return {"success": True, "path": _save(vr.content, filename), "provider": "Novita Kling i2v", "error": ""}
+                return {"success": False, "path": "", "provider": "Novita Kling i2v", "error": "Succeeded but no video_url"}
+            if status in ("TASK_STATUS_FAILED", "TASK_STATUS_CANCELED"):
+                return {"success": False, "path": "", "provider": "Novita Kling i2v", "error": f"Task {status}"}
+            delay = min(delay * 1.5, 30)
+        return {"success": False, "path": "", "provider": "Novita Kling i2v", "error": "Timed out after 300s"}
+    except Exception as e:
+        return {"success": False, "path": "", "provider": "Novita Kling i2v", "error": str(e)}
+
+
 # ── Public tool functions ──────────────────────────────────────────────────────
 
 def generate_image(
@@ -353,18 +555,22 @@ def generate_video(
     provider='auto' tries:
       1. Pollinations Video  (no key, free — Veo/Seedance/Wan)
       2. HuggingFace         (Wan2.2, free tier)
-      3. fal.ai              (CogVideoX, $20 signup credits)
+      3. Novita Kling        (async, $0.50 credits — novita.ai)
+      4. MiniMax/Hailuo      (async, minimax.io)
+      5. fal.ai              (CogVideoX, $20 signup credits)
 
     Tips for good video prompts:
     - Be specific about motion: "slow pan left", "zoom in", "flowing", "rippling"
     - Include camera direction: "drone shot descending", "handheld close-up"
     - Keep it 1-2 sentences focused on the visual action
     """
-    order = ["pollinations", "huggingface", "fal"] if provider == "auto" else [provider]
+    order = ["pollinations", "huggingface", "novita", "minimax", "fal"] if provider == "auto" else [provider]
 
     for p in order:
         if p == "pollinations":   result = _video_pollinations(prompt, filename)
         elif p == "huggingface":  result = _video_huggingface(prompt, filename)
+        elif p == "novita":       result = _video_novita(prompt, filename)
+        elif p == "minimax":      result = _video_minimax(prompt, filename)
         elif p == "fal":          result = _video_fal(prompt, filename)
         else: continue
 
@@ -377,6 +583,57 @@ def generate_video(
         "error": "Video generation failed. For best results set HF_TOKEN (free) or FAL_KEY ($20 free credits).",
         "manual_option": "Visit arena.ai/video for 3 free generations/day using Veo 3, Sora 2, Kling.",
         "self_host": "Run Wan2.1 locally (Apache 2.0, free forever) — needs 24GB VRAM GPU."
+    }
+
+
+def animate_image(
+    image_path: str,
+    motion_prompt: str,
+    filename: str,
+    provider: str = "auto",
+) -> dict:
+    """
+    Animate a still image into a short video clip.
+
+    provider='auto' tries in order:
+      1. fal.ai Kling i2v   (FAL_KEY, $20 signup credits)
+      2. fal.ai MiniMax i2v (FAL_KEY, same credits)
+      3. Novita Kling i2v   (NOVITA_API_KEY, $0.50 credits — async)
+
+    image_path can be a local file path or a public URL.
+    If local, the image is uploaded to fal.ai CDN automatically.
+    """
+    # Resolve image URL — upload local files to fal CDN first
+    def _resolve_url(path: str) -> str:
+        if path.startswith("http://") or path.startswith("https://"):
+            return path
+        if FAL_KEY:
+            uploaded = _upload_to_fal(path)
+            if uploaded:
+                return uploaded
+        # Fallback: can't upload without FAL_KEY, return as-is and let provider fail gracefully
+        return path
+
+    order = ["fal_kling", "fal_minimax", "novita"] if provider == "auto" else [provider]
+
+    for p in order:
+        img_url = _resolve_url(image_path)
+        if p == "fal_kling":
+            result = _i2v_fal_kling(img_url, motion_prompt, filename)
+        elif p == "fal_minimax":
+            result = _i2v_fal_minimax(img_url, motion_prompt, filename)
+        elif p == "novita":
+            result = _i2v_novita_kling(img_url, motion_prompt, filename)
+        else:
+            continue
+
+        if result["success"]:
+            return result
+        print(f"    [{p} i2v] failed: {result['error']}")
+
+    return {
+        "success": False, "path": "", "provider": "all",
+        "error": "All image-to-video providers failed. Set FAL_KEY ($20 free) or NOVITA_API_KEY ($0.50 credits).",
     }
 
 
@@ -561,9 +818,27 @@ TOOLS = [
             "properties": {
                 "prompt":   {"type": "string", "description": "Motion-focused video prompt. Include: what moves, camera direction, speed, mood. E.g. 'slow cinematic pan across a farmers market at golden hour, warm bokeh, shallow depth of field'"},
                 "filename": {"type": "string", "description": "Output filename e.g. reel_intro.mp4"},
-                "provider": {"type": "string", "enum": ["auto", "pollinations", "huggingface", "fal"], "default": "auto"},
+                "provider": {"type": "string", "enum": ["auto", "pollinations", "huggingface", "novita", "minimax", "fal"], "default": "auto"},
             },
             "required": ["prompt", "filename"],
+        },
+    },
+    {
+        "name": "animate_image",
+        "description": (
+            "Animate a still image into a short video clip. Takes a generated image and brings it to life "
+            "with motion. Use this after generating a hero image to create a Reel/TikTok version. "
+            "Provider auto order: fal.ai Kling → fal.ai MiniMax → Novita Kling."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "image_path":    {"type": "string", "description": "Local path to the image file (e.g. media_output/hero_01.jpg) or a public URL"},
+                "motion_prompt": {"type": "string", "description": "Describe the motion: what moves, how, camera direction. E.g. 'gentle breeze moves through the market stalls, slow pan left, warm golden light'"},
+                "filename":      {"type": "string", "description": "Output video filename e.g. hero_animated.mp4"},
+                "provider":      {"type": "string", "enum": ["auto", "fal_kling", "fal_minimax", "novita"], "default": "auto"},
+            },
+            "required": ["image_path", "motion_prompt", "filename"],
         },
     },
     {
@@ -658,6 +933,14 @@ def dispatch(name: str, inputs: dict) -> str:
         else:
             print(f"         ✗ Video failed: {result.get('manual_option','')}")
         return json.dumps(result)
+    elif name == "animate_image":
+        print(f"\n  [ANIMATE] {inputs.get('image_path')} → {inputs.get('filename')}...")
+        result = animate_image(**inputs)
+        if result["success"]:
+            print(f"            ✓ Saved: {result['path']}  [{result['provider']}]")
+        else:
+            print(f"            ✗ Animation failed: {result['error']}")
+        return json.dumps(result)
     elif name == "write_social_copy":
         result = write_social_copy(**inputs)
         return json.dumps(result)
@@ -685,10 +968,12 @@ Your job: deliver a COMPLETE, production-ready media package every single time.
 For every brief you MUST produce all of the following:
 1. Images — platform-optimized, professional prompts, use generate_image
 2. At least one video — use generate_video (try even if uncertain, Pollinations is free)
-3. Written copy — platform-native for each requested platform, use write_social_copy
-4. Music recommendation — mood + BPM + free sources, use recommend_music
-5. Posting schedule — best times per platform + 4-week strategy, use create_posting_schedule
-6. Package export — everything compiled, use compile_media_package LAST
+3. Animate hero image — ALWAYS call animate_image on the hero/main image after generating it.
+   A still image + its animated version = double the content from one prompt (still for feed, video for Reels/TikTok).
+4. Written copy — platform-native for each requested platform, use write_social_copy
+5. Music recommendation — mood + BPM + free sources, use recommend_music
+6. Posting schedule — best times per platform + 4-week strategy, use create_posting_schedule
+7. Package export — everything compiled, use compile_media_package LAST
 
 Image prompt standards (non-negotiable):
 - 50-200 words per prompt
